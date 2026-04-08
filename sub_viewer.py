@@ -136,8 +136,12 @@ def _ocr_align(video_path, whisper_segs, progress_cb=None):
     return aligned
 
 
-def generate_srt_sync(vid, progress_cb=None):
-    """Download video, run Whisper, translate. Returns SRT path."""
+def generate_srt_sync(vid, progress_cb=None, whisper_model='base'):
+    """Download video, run Whisper, translate. Returns SRT path.
+
+    Gen1 default: whisper medium (slower, used for initial development)
+    Gen2 default: whisper base (84ms timing, 10x faster, near-zero drift)
+    """
     import whisper
     import time
 
@@ -165,8 +169,8 @@ def generate_srt_sync(vid, progress_cb=None):
 
     # Step 2: Whisper
     if progress_cb:
-        progress_cb('Transcribing with Whisper medium...', 0.3)
-    model = whisper.load_model('medium')
+        progress_cb(f'Transcribing with Whisper {whisper_model}...', 0.3)
+    model = whisper.load_model(whisper_model)
     result = model.transcribe(str(video_path), language='ja')
 
     whisper_clean = []
@@ -230,7 +234,13 @@ def index():
         go_btn = ui.button('Go', color='primary')
         regen_btn = ui.button('Regen', color='warning').props('outline')
         align_btn = ui.button('OCR Align', color='info').props('outline')
-        offset_slider = ui.slider(min=-5, max=5, step=0.5, value=0).props('label-always').classes('w-48')
+    with ui.row().classes('w-full items-end gap-4'):
+        model_select = ui.select(
+            {'base': 'base (fast, best timing)', 'small': 'small (balanced)',
+             'medium': 'medium (gen1, best content)', 'turbo': 'turbo (fast, low drift)'},
+            value='base', label='Whisper model'
+        ).classes('w-48')
+        offset_slider = ui.slider(min=-5, max=5, step=0.1, value=0).props('label-always').classes('w-48')
         ui.label('Offset (s)').classes('text-xs')
 
     status_label = ui.label('').classes('text-sm text-gray-400')
@@ -321,7 +331,7 @@ def index():
             progress.set_value(val)
 
         try:
-            srt_path = await run.io_bound(generate_srt_sync, vid, update_progress)
+            srt_path = await run.io_bound(generate_srt_sync, vid, update_progress, model_select.value)
             subs = parse_srt(srt_path)
             status_label.set_text(f'Done! {len(subs)} subtitles generated.')
             progress.set_value(1.0)

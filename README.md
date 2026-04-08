@@ -101,3 +101,37 @@ Other things I tried along the way:
 ## License
 
 CC BY-NC-SA 4.0 — see [LICENSE](LICENSE)
+
+## Overnight Findings (2026-04-09)
+
+### Multi-AI Round Table
+Tested 3 models reading the same frames:
+
+| Model | 豚骨ラーメンと | これで！！！ | すみません (3 lines) |
+|---|---|---|---|
+| Gemini Flash | ✓ | ✓ | ✓✓✓ |
+| Llama Maverick | ✓ | ✓ | ✓ (mangled !) |
+| GPT-4.1 mini | ✓ | ✓ | ✓✓✓ |
+
+All 3 read text PP-OCR couldn't. Multi-model adds redundancy at ~3x cost.
+
+### Combined Pipeline (Binary Search + Gemini + Translate)
+Tested on 2 videos:
+
+| Video | Subs | Translated | Gemini calls | Time | Speaker tags |
+|---|---|---|---|---|---|
+| Kitchen car (71s) | 85 | 85 | 69 | 325s | pink/blue ✓ |
+| Strike zone (93s) | 44 | 44 | 52 | 239s | pink/blue ✓ |
+
+33ms timing precision via binary search on frame diffs. ~$0.007 per video.
+
+### Whisper Model Benchmark (MariMariMarie GT)
+
+| Model | Speed | Timing mean | Timing p90 | Drift |
+|---|---|---|---|---|
+| **base** | 10x faster | **84ms** | **140ms** | 0.02s |
+| small | 4x faster | 114ms | 270ms | -0.3s |
+| medium | 1.7x faster | 383ms | 830ms | -0.2s |
+| turbo | 2.5x faster | 227ms | 520ms | -0.02s |
+
+Smaller models = better timing. Base is the sweet spot.
