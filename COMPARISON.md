@@ -1,52 +1,55 @@
 # Pipeline Comparison: Kitchen Car Video (71s)
 
-## Methods
+## Final Results
 
-| Pipeline | Description | API calls | Cost |
+| Pipeline | Subs | Time | API calls | Cost | Timing | Speakers |
+|---|---|---|---|---|---|---|
+| Whisper base | 59 | 3s | 0 | Free | 84ms | No |
+| Whisper medium | 59 | 70s | 0 | Free | 383ms | No |
+| Visual YOLO+OCR | 23 | 44s | 0 | Free | 33ms | Yes |
+| **Gemini visual** | **75** | **250s** | **64** | **$0.006** | **33ms** | **Yes** |
+| Smart (Whisper+Gemini) | 56 | 132s | 28 | $0.003 | 33ms | Partial |
+
+## Multi-AI Round Table
+
+3 models read the same frames — all correct where PP-OCR failed:
+
+| Model | Speed | Accuracy | Cost/call |
 |---|---|---|---|
-| **Whisper base** | Audio transcription only | 0 | Free |
-| **Whisper medium** | Audio transcription (gen1 default) | 0 | Free |
-| **Visual YOLO+OCR** | Binary search → YOLO → PP-OCR per event | 0 | Free |
-| **Gemini visual** | Binary search → Gemini reads at boundaries | ~70 | ~$0.007 |
-| **Combined** | Whisper base timing + Gemini visual content + speaker tags | ~70 | ~$0.007 |
+| Gemini Flash | 3s | 100% | ~$0.0001 |
+| GPT-4.1 mini | 3s | 100% | ~$0.0002 |
+| Llama Maverick | 2s | ~95% | ~$0.0001 |
 
-## Results (to be filled after overnight runs)
+## Key Discoveries
 
-| Metric | Whisper base | Whisper medium | Visual YOLO+OCR | Gemini visual | Combined |
-|---|---|---|---|---|---|
-| Time | 3s | 70s | 44s | ~200s | TBD |
-| Subtitle lines | 59 | 59 | 23 | TBD | TBD |
-| Timing precision | 84ms | 383ms | 33ms | 33ms | 33ms |
-| Drift | +0.02s | -0.22s | N/A | N/A | N/A |
-| Content accuracy | ~95% | ~95% | ~70% | ~99%? | ~99%? |
-| Speaker separation | No | No | Yes (color) | Yes (color) | Yes |
-| Visual-only text | No | No | Yes | Yes | Yes |
-| Cost | Free | Free | Free | ~$0.007 | ~$0.007 |
+1. **Whisper base > medium for timing** (84ms vs 383ms, 10x faster)
+2. **PP-OCR mobile > server on stylized text** (correct 辛 where server failed)
+3. **Gemini reads styled Japanese perfectly** (zero errors, zero false positives)
+4. **Binary search gives 33ms precision** on subtitle boundaries
+5. **Speaker colors auto-detected** via pink/blue shadow on text
+6. **Multi-AI consensus** confirms readings — redundancy at pennies
 
-## Key Findings
+## Overnight Benchmarks
 
-### Whisper
-- Base model: best timing (84ms), 10x faster, near-zero drift
-- Medium: better content on edge cases but 4x worse timing
-- Cannot read visual-only text (end cards, signs)
-- No speaker separation
+### Whisper Model Comparison (MariMariMarie GT, ms-precision)
 
-### Visual (YOLO + OCR)  
-- Frame-perfect timing (33ms)
-- Speaker colors detected automatically
-- OCR accuracy limited by PP-OCR on stylized text (~70%)
-- Fully local, no API cost
+| Model | Speed | Mean offset | p90 | Drift |
+|---|---|---|---|---|
+| **base** | **10x** | **84ms** | **140ms** | **0.02s** |
+| small | 4x | 114ms | 270ms | -0.3s |
+| medium | 1.7x | 383ms | 830ms | -0.2s |
+| turbo | 2.5x | 227ms | 520ms | -0.02s |
 
-### Gemini Visual
-- Perfect text reading (zero errors on test frames)
-- Speaker color identification built-in
-- Frame-perfect timing via binary search
-- ~$0.007 per 1-min video (~20-70 calls)
-- 3s latency per call limits throughput
+Smaller = better timing. Counter-intuitive but consistent.
 
-### Best of All Worlds (proposed)
-- Whisper base for fast initial transcription + rough timing
-- Binary search for frame-perfect change boundaries  
-- Gemini reads at boundaries for perfect text + speaker tags
-- Merge: Whisper content confirmed/corrected by Gemini visual
-- Total: ~$0.007, frame-perfect, speaker-tagged, bilingual
+### Batch Processing (4 videos)
+
+| Video | Duration | Subs | Gemini calls | Time |
+|---|---|---|---|---|
+| Kitchen car | 71s | 75 | 64 | 250s |
+| Strike zone | 93s | 44 | 52 | 239s |
+| Ghost story | 106s | 16 | 29 | 123s |
+| Momotaro gacha | 85s | 48 | 57 | 220s |
+
+All speaker-tagged, all translated to Traditional Chinese.
+Total cost: ~$0.025 for 4 videos.
