@@ -3,7 +3,7 @@ YouTube subtitle viewer — paste URL, auto-loads cached subs or generates new o
 """
 from nicegui import ui, run
 from pathlib import Path
-import json, re, subprocess, asyncio
+import json, re, subprocess, asyncio, base64, requests
 
 SUBS_DIR = Path('subs')
 SUBS_DIR.mkdir(exist_ok=True)
@@ -136,6 +136,241 @@ def _ocr_align(video_path, whisper_segs, progress_cb=None):
     return aligned
 
 
+def _get_openrouter_key():
+    """Fetch OpenRouter API key from homelab credentials."""
+    try:
+        r = subprocess.run(['curl', '-su', 'evnchn:insecure', 'http://192.168.50.1:8080/999-credentials.html'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.split('\n'):
+            if 'OpenRouter' in line and 'sk-or-' in line:
+                import re as _re
+                m = _re.search(r'(sk-or-v1-[a-f0-9]+)', line)
+                if m: return m.group(1)
+    except: pass
+    return None
+
+
+def generate_gemini_video_srt_sync(vid, progress_cb=None):
+    """ONE Gemini call with YouTube URL → full subtitle extraction."""
+    api_key = _get_openrouter_key()
+    if not api_key:
+        raise RuntimeError('No OpenRouter API key found')
+
+    if progress_cb: progress_cb('Sending video to Gemini...', 0.2)
+
+    r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": """Watch this video and extract ALL burned-in subtitle text with timestamps.
+
+For each subtitle appearance, return:
+- start_time (seconds, precise)
+- end_time (seconds, precise)
+- text (the Japanese subtitle text)
+- speaker: "pink" or "blue" (based on the colored drop shadow on the text)
+
+The subtitles have a distinctive style: white text fill, black outline, with either a pink (#FC8DC2) or blue (#8EC6FD) drop shadow indicating the speaker.
+
+Return as JSON array. Be precise with timestamps. Include ALL subtitle lines."""},
+                {"type": "video_url", "video_url": {"url": f"https://www.youtube.com/watch?v={vid}"}}
+            ]}],
+            "response_format": {"type": "json_object"}
+        },
+        timeout=180
+    )
+
+    if progress_cb: progress_cb('Parsing response...', 0.7)
+
+    content = r.json()['choices'][0]['message']['content']
+    data = json.loads(content)
+    if isinstance(data, dict):
+        data = data.get('subtitles', data.get('results', data.get('lines', [])))
+
+    if progress_cb: progress_cb(f'Translating {len(data)} lines...', 0.8)
+
+    # Translate
+    numbered = '\n'.join(f"{i+1}. {s.get('text','')}" for i, s in enumerate(data))
+    try:
+        tr = requests.post("https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": "google/gemini-2.5-flash",
+                  "messages": [{"role": "user", "content": f"Translate each Japanese line to Traditional Chinese. Comedy anime. Natural, punchy. Output ONLY numbered translations.\n\n{numbered}"}]},
+            timeout=60)
+        translations = {}
+        for line in tr.json()['choices'][0]['message']['content'].strip().split('\n'):
+            parts = line.strip().split('. ', 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                translations[int(parts[0])-1] = parts[1]
+    except: translations = {}
+
+    if progress_cb: progress_cb('Writing SRT...', 0.95)
+
+    def fmt(s):
+        hh=int(s//3600); m=int((s%3600)//60); sec=int(s%60); ms=int((s%1)*1000)
+        return f"{hh:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+    srt_lines = []
+    for i, s in enumerate(data):
+        start = s.get('start_time', 0)
+        end = s.get('end_time', start + 1)
+        text = s.get('text', '')
+        speaker = s.get('speaker', '?')
+        srt_lines.append(str(i+1))
+        srt_lines.append(f"{fmt(start)} --> {fmt(end)}")
+        srt_lines.append(f"[{speaker}] {text}")
+        if i in translations:
+            srt_lines.append(translations[i])
+        srt_lines.append('')
+
+    srt_path = SUBS_DIR / f'{vid}.srt'
+    srt_path.write_text('\n'.join(srt_lines), encoding='utf-8')
+    return srt_path
+
+
+def generate_gemini_srt_sync(vid, progress_cb=None):
+    """Combined pipeline: binary search + Gemini reads at boundaries + translate."""
+    import cv2, numpy as np
+    from difflib import SequenceMatcher
+
+    api_key = _get_openrouter_key()
+    if not api_key:
+        raise RuntimeError('No OpenRouter API key found')
+
+    video_path = SUBS_DIR / f'{vid}.webm'
+    srt_path = SUBS_DIR / f'{vid}.srt'
+
+    # Download
+    if progress_cb: progress_cb('Downloading...', 0.05)
+    if not video_path.exists():
+        subprocess.run(['yt-dlp', '--no-playlist', '-o', str(video_path),
+                        f'https://www.youtube.com/watch?v={vid}'], capture_output=True, timeout=120)
+        for ext in ['webm', 'mp4', 'mkv']:
+            p = SUBS_DIR / f'{vid}.{ext}'
+            if p.exists(): video_path = p; break
+    if not video_path.exists():
+        raise RuntimeError('Download failed')
+
+    cap = cv2.VideoCapture(str(video_path))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    dur = cap.get(cv2.CAP_PROP_FRAME_COUNT) / cap.get(cv2.CAP_PROP_FPS)
+
+    def frame_at(ms):
+        cap.set(cv2.CAP_PROP_POS_MSEC, ms); ret, f = cap.read(); return f if ret else None
+    def zone_diff(f1, f2):
+        g1, g2 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY), cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
+        return max(cv2.absdiff(g1[:int(h*0.3),:], g2[:int(h*0.3),:]).mean(),
+                   cv2.absdiff(g1[int(h*0.75):,:], g2[int(h*0.75):,:]).mean())
+
+    # Binary search
+    if progress_cb: progress_cb('Scanning for subtitle boundaries...', 0.1)
+    changes = []; prev = frame_at(0)
+    for t_ms in range(500, int(dur*1000), 500):
+        curr = frame_at(t_ms)
+        if curr is None: break
+        if zone_diff(prev, curr) > 18: changes.append(t_ms)
+        prev = curr
+
+    exact = []
+    for c in changes:
+        lo, hi = c-500, c; f_lo = frame_at(lo)
+        while hi-lo > 33:
+            mid = (lo+hi)//2
+            if zone_diff(f_lo, frame_at(mid)) > 12: hi = mid
+            else: lo = mid
+        exact.append(hi)
+
+    deduped = [0]
+    for t in exact:
+        if t - deduped[-1] > 400: deduped.append(t)
+
+    # Gemini reads
+    if progress_cb: progress_cb(f'Gemini reading {len(deduped)} boundaries...', 0.3)
+    events = []; prev_texts = set()
+    prev_reading = "[]"  # temporal context: what Gemini read last frame
+    def normalize(t): return re.sub(r'[！!\-\.。、\s8]+', '', t)
+
+    for i, t_ms in enumerate(deduped):
+        frame = frame_at(t_ms)
+        if frame is None: continue
+        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        b64 = base64.b64encode(buf).decode()
+        # Build prompt with temporal context
+        ctx = f"\nPrevious frame had: {prev_reading}\nText already showing is the SAME speaker. NEW text is likely the OTHER speaker." if prev_reading != "[]" else ""
+        prompt = f"Read subtitle text in this animation frame. The text has colored drop shadows: pink (#FC8DC2) = Speaker A, blue (#8EC6FD) = Speaker B. Identify speaker by shadow color.{ctx}\nReturn JSON array: [{{\"text\": \"...\", \"speaker\": \"pink\" or \"blue\"}}]. If no subtitle, return []."
+        try:
+            r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": "google/gemini-2.5-flash",
+                      "messages": [{"role": "user", "content": [
+                          {"type": "text", "text": prompt},
+                          {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}],
+                      "response_format": {"type": "json_object"}}, timeout=20)
+            data = json.loads(r.json()['choices'][0]['message']['content'])
+            if isinstance(data, dict): data = data.get('subtitles', data.get('results', []))
+            subs = data if isinstance(data, list) else []
+        except: subs = []
+
+        next_t = deduped[i+1] if i+1 < len(deduped) else int(dur*1000)
+        for s in subs:
+            text = s.get('text','').strip(); speaker = s.get('speaker','?')
+            if not text or len(text) < 2: continue
+            is_new = not any(SequenceMatcher(None, normalize(text), normalize(pt)).ratio() > 0.6 for pt in prev_texts)
+            if is_new:
+                events.append({'start': t_ms/1000, 'end': next_t/1000, 'text': text, 'speaker': speaker})
+        prev_texts = {s.get('text','') for s in subs if s.get('text','')}
+        # Update temporal context for next frame
+        if subs:
+            prev_reading = json.dumps([{"text": s.get("text",""), "speaker": s.get("speaker","?")} for s in subs], ensure_ascii=False)
+        else:
+            prev_reading = "[]"
+
+        if progress_cb and (i+1) % 10 == 0:
+            progress_cb(f'Gemini: {i+1}/{len(deduped)} boundaries...', 0.3 + 0.4 * i / len(deduped))
+
+    # Merge
+    merged = []
+    for e in events:
+        if merged and SequenceMatcher(None, normalize(e['text']), normalize(merged[-1]['text'])).ratio() > 0.6:
+            merged[-1]['end'] = e['end']
+        else: merged.append(dict(e))
+    merged = [m for m in merged if m['end'] - m['start'] >= 0.3]
+
+    cap.release()
+    video_path.unlink(missing_ok=True)
+
+    # Translate
+    if progress_cb: progress_cb(f'Translating {len(merged)} lines...', 0.8)
+    numbered = '\n'.join(f"{i+1}. {m['text']}" for i, m in enumerate(merged))
+    try:
+        r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": "google/gemini-2.5-flash",
+                  "messages": [{"role": "user", "content": f"Translate each Japanese line to Traditional Chinese. Comedy anime. Output ONLY numbered translations.\n\n{numbered}"}]},
+            timeout=60)
+        translations = {}
+        for line in r.json()['choices'][0]['message']['content'].strip().split('\n'):
+            parts = line.strip().split('. ', 1)
+            if len(parts) == 2 and parts[0].isdigit(): translations[int(parts[0])-1] = parts[1]
+    except: translations = {}
+
+    # Write SRT
+    if progress_cb: progress_cb('Writing SRT...', 0.95)
+    def fmt(s):
+        hh=int(s//3600); m=int((s%3600)//60); sec=int(s%60); ms=int((s%1)*1000)
+        return f"{hh:02d}:{m:02d}:{sec:02d},{ms:03d}"
+    srt_lines = []
+    for i, m in enumerate(merged):
+        srt_lines.append(str(i+1))
+        srt_lines.append(f"{fmt(m['start'])} --> {fmt(m['end'])}")
+        srt_lines.append(f"[{m['speaker']}] {m['text']}")
+        if i in translations: srt_lines.append(translations[i])
+        srt_lines.append('')
+    srt_path.write_text('\n'.join(srt_lines), encoding='utf-8')
+    return srt_path
+
+
 def generate_srt_sync(vid, progress_cb=None, whisper_model='base'):
     """Download video, run Whisper, translate. Returns SRT path.
 
@@ -235,9 +470,14 @@ def index():
         regen_btn = ui.button('Regen', color='warning').props('outline')
         align_btn = ui.button('OCR Align', color='info').props('outline')
     with ui.row().classes('w-full items-end gap-4'):
+        engine_select = ui.select(
+            {'whisper': 'Whisper only (fast, free)',
+             'gemini_video': 'Gemini video (1 call, ~$0.01)',
+             'gemini': 'Gemini frame-by-frame (legacy)'},
+            value='gemini_video', label='Engine'
+        ).classes('w-48')
         model_select = ui.select(
-            {'base': 'base (fast, best timing)', 'small': 'small (balanced)',
-             'medium': 'medium (gen1, best content)', 'turbo': 'turbo (fast, low drift)'},
+            {'base': 'base (best timing)', 'small': 'small', 'medium': 'medium'},
             value='base', label='Whisper model'
         ).classes('w-48')
         offset_slider = ui.slider(min=-5, max=5, step=0.1, value=0).props('label-always').classes('w-48')
@@ -331,7 +571,12 @@ def index():
             progress.set_value(val)
 
         try:
-            srt_path = await run.io_bound(generate_srt_sync, vid, update_progress, model_select.value)
+            if engine_select.value == 'gemini_video':
+                srt_path = await run.io_bound(generate_gemini_video_srt_sync, vid, update_progress)
+            elif engine_select.value == 'gemini':
+                srt_path = await run.io_bound(generate_gemini_srt_sync, vid, update_progress)
+            else:
+                srt_path = await run.io_bound(generate_srt_sync, vid, update_progress, model_select.value)
             subs = parse_srt(srt_path)
             status_label.set_text(f'Done! {len(subs)} subtitles generated.')
             progress.set_value(1.0)
