@@ -3,7 +3,8 @@ YouTube subtitle viewer — paste URL, auto-loads cached subs or generates new o
 """
 from nicegui import ui, run
 from pathlib import Path
-import json, re, subprocess, asyncio, base64, requests
+import json, re, subprocess, asyncio, base64, requests, numpy as np
+import cv2
 
 SUBS_DIR = Path('subs')
 SUBS_DIR.mkdir(exist_ok=True)
@@ -22,8 +23,47 @@ def parse_srt(path):
         g = [int(x) for x in m.groups()]
         start = g[0]*3600 + g[1]*60 + g[2] + g[3]/1000
         end = g[4]*3600 + g[5]*60 + g[6] + g[7]/1000
-        entries.append({'start': start, 'end': end, 'text': '\n'.join(lines[2:])})
+
+        # Parse speaker tag and translation
+        text_line = lines[2] if len(lines) > 2 else ''
+        speaker = '?'
+        sm = re.match(r'\[(\w+)\]\s*(.*)', text_line)
+        if sm:
+            speaker = sm.group(1)
+            text_line = sm.group(2)
+
+        translation = ''
+        if len(lines) > 3 and not re.match(r'\d+$', lines[3]) and '-->' not in lines[3]:
+            translation = lines[3]
+
+        entries.append({'start': start, 'end': end, 'text': text_line,
+                        'speaker': speaker, 'translation': translation})
     return entries
+
+
+def load_subs(path):
+    """Load subs from JSON (native) or SRT (legacy). Returns list of events for viewer."""
+    path = Path(path)
+    if path.suffix == '.json':
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data.get('events', [])
+    else:
+        # Legacy SRT → convert to event format
+        entries = parse_srt(path)
+        # Group overlapping entries into events
+        events = []
+        for e in entries:
+            if events and abs(e['start'] - events[-1]['time']) < 0.1:
+                events[-1]['lines'].append({
+                    'text': e['text'], 'color': e.get('speaker', 'white'),
+                    'zh': e.get('translation', '')})
+            else:
+                events.append({
+                    'time': e['start'],
+                    'lines': [{'text': e['text'], 'color': e.get('speaker', 'white'),
+                               'zh': e.get('translation', '')}]
+                })
+        return events
 
 
 def extract_video_id(url):
@@ -31,14 +71,12 @@ def extract_video_id(url):
     return m.group(1) if m else None
 
 
-def find_existing_srt(vid):
-    """Check if we already have an SRT for this video ID."""
-    # Check subs/ dir first
+def find_existing_sub(vid):
+    """Check if we already have subs for this video ID. Prefer JSON over SRT."""
+    json_path = SUBS_DIR / f'{vid}.json'
+    if json_path.exists():
+        return json_path
     for f in SUBS_DIR.glob('*.srt'):
-        if vid in f.stem:
-            return f
-    # Check root dir (legacy)
-    for f in Path('.').glob('*.srt'):
         if vid in f.stem:
             return f
     return None
@@ -150,43 +188,72 @@ def _get_openrouter_key():
     return None
 
 
+def _gemini_video_call(api_key, vid, start_from=0):
+    """Single Gemini video call, optionally from a timestamp."""
+    extra = f" Start from {start_from:.0f} seconds — skip earlier content." if start_from > 5 else ""
+    r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": "google/gemini-2.5-flash",
+              "messages": [{"role": "user", "content": [
+                  {"type": "text", "text": f"Extract ALL burned-in subtitle text with timestamps from this video.{extra} Return JSON: [{{\"start_time\": number, \"end_time\": number, \"text\": \"...\", \"speaker\": \"pink\" or \"blue\"}}]. All times as NUMBERS (seconds). Continue to the VERY END."},
+                  {"type": "video_url", "video_url": {"url": f"https://www.youtube.com/watch?v={vid}"}}]}],
+              "response_format": {"type": "json_object"}},
+        timeout=300)
+    data = json.loads(r.json()['choices'][0]['message']['content'])
+    if isinstance(data, dict): data = data.get('subtitles', data.get('results', []))
+    return data
+
+
 def generate_gemini_video_srt_sync(vid, progress_cb=None):
-    """ONE Gemini call with YouTube URL → full subtitle extraction."""
+    """Gemini video with retry until full coverage."""
+    from difflib import SequenceMatcher
+
     api_key = _get_openrouter_key()
     if not api_key:
         raise RuntimeError('No OpenRouter API key found')
 
-    if progress_cb: progress_cb('Sending video to Gemini...', 0.2)
+    # Get video duration
+    dur_out = subprocess.run(['yt-dlp', '--print', 'duration', f'https://www.youtube.com/watch?v={vid}'],
+        capture_output=True, text=True, timeout=15)
+    duration = float(dur_out.stdout.strip()) if dur_out.stdout.strip() else 120
 
-    r = requests.post("https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": "google/gemini-2.5-flash",
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": """Watch this video and extract ALL burned-in subtitle text with timestamps.
+    all_subs = []
+    covered_until = 0
+    calls = 0
+    max_retries = 3
 
-For each subtitle appearance, return:
-- start_time (seconds, precise)
-- end_time (seconds, precise)
-- text (the Japanese subtitle text)
-- speaker: "pink" or "blue" (based on the colored drop shadow on the text)
+    for attempt in range(max_retries + 1):
+        if progress_cb:
+            progress_cb(f'Gemini call {attempt+1} (from {covered_until:.0f}s)...', 0.1 + 0.15 * attempt)
 
-The subtitles have a distinctive style: white text fill, black outline, with either a pink (#FC8DC2) or blue (#8EC6FD) drop shadow indicating the speaker.
+        subs = _gemini_video_call(api_key, vid, start_from=covered_until if covered_until > 5 else 0)
+        calls += 1
 
-Return as JSON array. Be precise with timestamps. Include ALL subtitle lines."""},
-                {"type": "video_url", "video_url": {"url": f"https://www.youtube.com/watch?v={vid}"}}
-            ]}],
-            "response_format": {"type": "json_object"}
-        },
-        timeout=180
-    )
+        new_subs = [s for s in subs if float(s.get('start_time', 0)) >= covered_until - 2]
+        all_subs.extend(new_subs)
 
-    if progress_cb: progress_cb('Parsing response...', 0.7)
+        if subs:
+            last_t = max(float(s.get('end_time', 0)) for s in subs)
+            coverage = last_t / duration * 100
+            if coverage >= 85:
+                break
+            covered_until = last_t - 5
+        else:
+            break
 
-    content = r.json()['choices'][0]['message']['content']
-    data = json.loads(content)
-    if isinstance(data, dict):
-        data = data.get('subtitles', data.get('results', data.get('lines', [])))
+    # Deduplicate overlapping results
+    def normalize(t): return t.replace('！','!').replace('！','!').strip()
+    deduped = []
+    for s in sorted(all_subs, key=lambda x: float(x.get('start_time', 0))):
+        if deduped:
+            prev = deduped[-1]
+            if abs(float(s.get('start_time',0)) - float(prev.get('start_time',0))) < 1 and \
+               SequenceMatcher(None, normalize(s.get('text','')), normalize(prev.get('text',''))).ratio() > 0.6:
+                continue
+        deduped.append(s)
+
+    data = deduped
+    if progress_cb: progress_cb(f'{len(data)} subs in {calls} calls, translating...', 0.7)
 
     if progress_cb: progress_cb(f'Translating {len(data)} lines...', 0.8)
 
@@ -229,9 +296,65 @@ Return as JSON array. Be precise with timestamps. Include ALL subtitle lines."""
     return srt_path
 
 
+def _temporal_consistency(events):
+    """Sequential pass to fix parallel Gemini inconsistencies.
+    Aggressive dedup: Gemini reads same text differently each frame.
+    """
+    if not events:
+        return events
+
+    def norm(t):
+        """Ultra-aggressive normalize: strip ALL non-kanji/kana."""
+        return re.sub(r'[^ぁ-んァ-ヶ一-龥a-zA-Z]', '', t)
+
+    def event_fingerprint(lines):
+        """Fingerprint an event by sorted normalized text of all lines."""
+        return tuple(sorted(norm(l['text']) for l in lines if norm(l['text'])))
+
+    def events_similar(fp1, fp2):
+        """Check if two event fingerprints are similar (>60% character overlap)."""
+        if not fp1 or not fp2:
+            return fp1 == fp2
+        # Join all text, compare as character sets
+        t1 = ''.join(fp1)
+        t2 = ''.join(fp2)
+        if not t1 or not t2:
+            return False
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, t1, t2).ratio() > 0.6
+
+    cleaned = []
+    color_memory = {}
+
+    for i, event in enumerate(events):
+        lines = event.get('lines', [])
+        if not lines:
+            continue
+
+        # Lock colors
+        for line in lines:
+            tn = norm(line['text'])
+            if tn in color_memory:
+                if line['color'] == 'white' and color_memory[tn] != 'white':
+                    line['color'] = color_memory[tn]
+            elif line['color'] != 'white':
+                color_memory[tn] = line['color']
+
+        # Compare to previous: skip if similar
+        curr_fp = event_fingerprint(lines)
+        if cleaned:
+            prev_fp = event_fingerprint(cleaned[-1].get('lines', []))
+            if events_similar(curr_fp, prev_fp):
+                continue
+
+        cleaned.append(event)
+
+    return cleaned
+
+
 def generate_gemini_srt_sync(vid, progress_cb=None):
     """Combined pipeline: binary search + Gemini reads at boundaries + translate."""
-    import cv2, numpy as np
+    # cv2/numpy imported at top level
     from difflib import SequenceMatcher
 
     api_key = _get_openrouter_key()
@@ -258,117 +381,116 @@ def generate_gemini_srt_sync(vid, progress_cb=None):
 
     def frame_at(ms):
         cap.set(cv2.CAP_PROP_POS_MSEC, ms); ret, f = cap.read(); return f if ret else None
-    def zone_diff(f1, f2):
-        g1, g2 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY), cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
-        return max(cv2.absdiff(g1[:int(h*0.3),:], g2[:int(h*0.3),:]).mean(),
-                   cv2.absdiff(g1[int(h*0.75):,:], g2[int(h*0.75):,:]).mean())
 
-    # Binary search
-    if progress_cb: progress_cb('Scanning for subtitle boundaries...', 0.1)
-    changes = []; prev = frame_at(0)
-    for t_ms in range(500, int(dur*1000), 500):
-        curr = frame_at(t_ms)
-        if curr is None: break
-        if zone_diff(prev, curr) > 18: changes.append(t_ms)
-        prev = curr
+    # CoreML detection fingerprint at 5fps
+    if progress_cb: progress_cb('CoreML detection scan (5fps)...', 0.1)
+    import onnxruntime
+    det_path = str(Path(__file__).parent / 'venv/lib/python3.12/site-packages/rapidocr/models/ch_PP-OCRv5_mobile_det.onnx')
+    try:
+        det_session = onnxruntime.InferenceSession(det_path, providers=[
+            ('CoreMLExecutionProvider', {'MLComputeUnits': 'ALL'}), 'CPUExecutionProvider'])
+    except:
+        det_session = onnxruntime.InferenceSession(det_path, providers=['CPUExecutionProvider'])
+    det_input = det_session.get_inputs()[0].name
 
-    exact = []
-    for c in changes:
-        lo, hi = c-500, c; f_lo = frame_at(lo)
-        while hi-lo > 33:
-            mid = (lo+hi)//2
-            if zone_diff(f_lo, frame_at(mid)) > 12: hi = mid
-            else: lo = mid
-        exact.append(hi)
+    heatmaps = []  # (t_ms, binary_heatmap)
+    for t_ms in range(0, int(dur*1000), 200):  # 5fps
+        frame = frame_at(t_ms)
+        if frame is None: break
+        scale = 640 / frame.shape[1]
+        resized = cv2.resize(frame, (640, int(frame.shape[0] * scale)))
+        pad_h = (32 - resized.shape[0] % 32) % 32
+        padded = cv2.copyMakeBorder(resized, 0, pad_h, 0, 0, cv2.BORDER_CONSTANT, value=0)
+        blob = (padded.astype(np.float32) / 255.0).transpose(2, 0, 1)[np.newaxis]
+        output = det_session.run(None, {det_input: blob})
+        hm_bin = (output[0][0, 0] > 0.3).astype(np.uint8)
+        heatmaps.append((t_ms, hm_bin))
 
-    deduped = [0]
-    for t in exact:
-        if t - deduped[-1] > 400: deduped.append(t)
+    # Pixel-level IoU dedup: keep only frames where heatmap pattern changed
+    def hm_iou(a, b):
+        inter = (a & b).sum(); union = (a | b).sum()
+        return inter / max(union, 1)
 
-    # Gemini reads
-    if progress_cb: progress_cb(f'Gemini reading {len(deduped)} boundaries...', 0.3)
-    events = []; prev_texts = set()
-    prev_reading = "[]"  # temporal context: what Gemini read last frame
+    deduped_hm = [heatmaps[0]]
+    for i in range(1, len(heatmaps)):
+        if hm_iou(heatmaps[i][1], deduped_hm[-1][1]) < 0.75:
+            deduped_hm.append(heatmaps[i])
+    deduped = [t_ms for t_ms, _ in deduped_hm]
+
+    # Gemini reads — parallel (8 concurrent)
+    if progress_cb: progress_cb(f'Gemini reading {len(deduped)} boundaries (parallel)...', 0.3)
     def normalize(t): return re.sub(r'[！!\-\.。、\s8]+', '', t)
 
-    for i, t_ms in enumerate(deduped):
+    # Prepare frames
+    frames_to_read = []
+    for t_ms in deduped:
         frame = frame_at(t_ms)
-        if frame is None: continue
-        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-        b64 = base64.b64encode(buf).decode()
-        # Build prompt with temporal context
-        ctx = f"\nPrevious frame had: {prev_reading}\nText already showing is the SAME speaker. NEW text is likely the OTHER speaker." if prev_reading != "[]" else ""
-        prompt = f"Read subtitle text in this animation frame. The text has colored drop shadows: pink (#FC8DC2) = Speaker A, blue (#8EC6FD) = Speaker B. Identify speaker by shadow color.{ctx}\nReturn JSON array: [{{\"text\": \"...\", \"speaker\": \"pink\" or \"blue\"}}]. If no subtitle, return []."
+        if frame is not None:
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            frames_to_read.append((t_ms, base64.b64encode(buf).decode()))
+
+    def read_one(args):
+        t_ms, b64 = args
         try:
             r = requests.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={"model": "google/gemini-2.5-flash",
                       "messages": [{"role": "user", "content": [
-                          {"type": "text", "text": prompt},
+                          {"type": "text", "text": 'Read ALL text visible in this frame. Classify each line by priority:\n- "active": current main subtitle/dialogue (most important)\n- "persist": previous subtitle still visible on screen\n- "bg": background element (signs, blackboard, posters, dates)\nAlso pick closest color: pink, blue, red, yellow, green, orange, purple, cyan, white. Translate to Traditional Chinese.\nReturn JSON: [{"text": "...", "priority": "active/persist/bg", "color": "palette", "zh": "translation"}].'},
                           {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}],
                       "response_format": {"type": "json_object"}}, timeout=20)
             data = json.loads(r.json()['choices'][0]['message']['content'])
             if isinstance(data, dict): data = data.get('subtitles', data.get('results', []))
-            subs = data if isinstance(data, list) else []
-        except: subs = []
+            return (t_ms, data if isinstance(data, list) else [])
+        except: return (t_ms, [])
 
-        next_t = deduped[i+1] if i+1 < len(deduped) else int(dur*1000)
-        for s in subs:
-            text = s.get('text','').strip(); speaker = s.get('speaker','?')
-            if not text or len(text) < 2: continue
-            is_new = not any(SequenceMatcher(None, normalize(text), normalize(pt)).ratio() > 0.6 for pt in prev_texts)
-            if is_new:
-                events.append({'start': t_ms/1000, 'end': next_t/1000, 'text': text, 'speaker': speaker})
-        prev_texts = {s.get('text','') for s in subs if s.get('text','')}
-        # Update temporal context for next frame
-        if subs:
-            prev_reading = json.dumps([{"text": s.get("text",""), "speaker": s.get("speaker","?")} for s in subs], ensure_ascii=False)
-        else:
-            prev_reading = "[]"
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(read_one, item): item[0] for item in frames_to_read}
+        done = 0
+        for future in as_completed(futures):
+            t_ms, subs = future.result()
+            results_map[t_ms] = subs
+            done += 1
+            if progress_cb and done % 10 == 0:
+                progress_cb(f'Gemini: {done}/{len(frames_to_read)}...', 0.3 + 0.4 * done / len(frames_to_read))
 
-        if progress_cb and (i+1) % 10 == 0:
-            progress_cb(f'Gemini: {i+1}/{len(deduped)} boundaries...', 0.3 + 0.4 * i / len(deduped))
-
-    # Merge
-    merged = []
-    for e in events:
-        if merged and SequenceMatcher(None, normalize(e['text']), normalize(merged[-1]['text'])).ratio() > 0.6:
-            merged[-1]['end'] = e['end']
-        else: merged.append(dict(e))
-    merged = [m for m in merged if m['end'] - m['start'] >= 0.3]
+    # Native format: each timestamp = ALL lines Gemini saw at that moment
+    # Dedup consecutive identical reads
+    events = []
+    prev_key = None
+    for t_ms in sorted(results_map.keys()):
+        subs = results_map[t_ms]
+        lines = [{'text': s.get('text','').strip(),
+                  'color': s.get('color', s.get('speaker', 'white')),
+                  'zh': s.get('zh', '')}
+                 for s in subs if s.get('text','').strip() and len(s.get('text','').strip()) > 1]
+        curr_key = tuple(normalize(l['text']) for l in lines)
+        if curr_key == prev_key:
+            continue
+        prev_key = curr_key
+        if lines:
+            events.append({'time': round(t_ms / 1000, 3), 'lines': lines})
 
     cap.release()
     video_path.unlink(missing_ok=True)
 
-    # Translate
-    if progress_cb: progress_cb(f'Translating {len(merged)} lines...', 0.8)
-    numbered = '\n'.join(f"{i+1}. {m['text']}" for i, m in enumerate(merged))
-    try:
-        r = requests.post("https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={"model": "google/gemini-2.5-flash",
-                  "messages": [{"role": "user", "content": f"Translate each Japanese line to Traditional Chinese. Comedy anime. Output ONLY numbered translations.\n\n{numbered}"}]},
-            timeout=60)
-        translations = {}
-        for line in r.json()['choices'][0]['message']['content'].strip().split('\n'):
-            parts = line.strip().split('. ', 1)
-            if len(parts) == 2 and parts[0].isdigit(): translations[int(parts[0])-1] = parts[1]
-    except: translations = {}
+    # Temporal consistency pass
+    if progress_cb: progress_cb('Temporal consistency...', 0.9)
+    events = _temporal_consistency(events)
 
-    # Write SRT
-    if progress_cb: progress_cb('Writing SRT...', 0.95)
-    def fmt(s):
-        hh=int(s//3600); m=int((s%3600)//60); sec=int(s%60); ms=int((s%1)*1000)
-        return f"{hh:02d}:{m:02d}:{sec:02d},{ms:03d}"
-    srt_lines = []
-    for i, m in enumerate(merged):
-        srt_lines.append(str(i+1))
-        srt_lines.append(f"{fmt(m['start'])} --> {fmt(m['end'])}")
-        srt_lines.append(f"[{m['speaker']}] {m['text']}")
-        if i in translations: srt_lines.append(translations[i])
-        srt_lines.append('')
-    srt_path.write_text('\n'.join(srt_lines), encoding='utf-8')
-    return srt_path
+    # Write native JSON
+    if progress_cb: progress_cb('Saving...', 0.95)
+    from datetime import datetime
+    data = {
+        'version': 1, 'video_id': vid, 'duration': dur,
+        'generated_at': datetime.now().isoformat(),
+        'engine': 'gemini_coreml', 'events': events,
+    }
+    json_path = SUBS_DIR / f'{vid}.json'
+    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    return json_path
 
 
 def generate_srt_sync(vid, progress_cb=None, whisper_model='base'):
@@ -471,10 +593,10 @@ def index():
         align_btn = ui.button('OCR Align', color='info').props('outline')
     with ui.row().classes('w-full items-end gap-4'):
         engine_select = ui.select(
-            {'whisper': 'Whisper only (fast, free)',
-             'gemini_video': 'Gemini video (1 call, ~$0.01)',
-             'gemini': 'Gemini frame-by-frame (legacy)'},
-            value='gemini_video', label='Engine'
+            {'gemini': 'Gemini frame-by-frame (~$0.007)',
+             'whisper': 'Whisper only (fast, free)',
+             'gemini_video': 'Gemini video (experimental)'},
+            value='gemini', label='Engine'
         ).classes('w-48')
         model_select = ui.select(
             {'base': 'base (best timing)', 'small': 'small', 'medium': 'medium'},
@@ -482,15 +604,20 @@ def index():
         ).classes('w-48')
         offset_slider = ui.slider(min=-5, max=5, step=0.1, value=0).props('label-always').classes('w-48')
         ui.label('Offset (s)').classes('text-xs')
+    with ui.row().classes('w-full items-center gap-4'):
+        show_persist = ui.switch('Show persisting subs', value=False).classes('text-sm')
+        show_bg = ui.switch('Show background text', value=False).classes('text-sm')
 
     status_label = ui.label('').classes('text-sm text-gray-400')
     progress = ui.linear_progress(value=0, show_value=False).classes('w-full').style('display:none')
 
     player_container = ui.element('div').classes('w-full flex justify-center mt-4')
-    sub_label = ui.label('').classes('text-2xl font-bold text-center w-full').style(
-        'min-height:80px; white-space:pre-wrap; margin-top:8px;')
 
-    _state = {'timer': None, 'subs': []}
+    # Multi-line colored subtitle container
+    sub_container = ui.column().classes('w-full items-center gap-0').style(
+        'min-height:100px; margin-top:8px;')
+
+    _state = {'timer': None, 'subs': [], 'sub_elements': []}
 
     async def start_player(vid, subs):
         _state['subs'] = subs
@@ -530,13 +657,70 @@ def index():
                     'window._boku_player && window._boku_player.getCurrentTime ? window._boku_player.getCurrentTime() : -1',
                     timeout=2)
                 if t is not None and t >= 0:
-                    t_adj = t + offset_slider.value  # apply user offset
-                    current = ''
-                    for s in _state['subs']:
-                        if s['start'] <= t_adj <= s['end']:
-                            current = s['text']
+                    t_adj = t + offset_slider.value
+
+                    # Find the latest event at this time
+                    active_event = None
+                    for event in _state['subs']:
+                        t_event = event.get('time', event.get('start', 0))
+                        if t_event <= t_adj:
+                            active_event = event
+                        else:
                             break
-                    sub_label.set_text(current)
+
+                    # Get lines from the active event, filtered by priority switches
+                    if active_event and 'lines' in active_event:
+                        active = []
+                        for line in active_event['lines']:
+                            pri = line.get('priority', 'active')
+                            if pri == 'active':
+                                active.append(line)
+                            elif pri == 'persist' and show_persist.value:
+                                active.append(line)
+                            elif pri == 'bg' and show_bg.value:
+                                active.append(line)
+                    elif active_event:
+                        active = [active_event]
+                    else:
+                        active = []
+
+                    # Build display — only update if changed
+                    active_key = tuple((s.get('text',''), s.get('color', s.get('speaker',''))) for s in active)
+                    prev_key = tuple((s.get('text',''), s.get('color', s.get('speaker',''))) for s in _state.get('prev_active', []))
+
+                    if active_key != prev_key:
+                        sub_container.clear()
+                        with sub_container:
+                            for s in active:
+                                text = s.get('text', '')
+                                speaker = s.get('color', s.get('speaker', '?'))
+                                # Map color name to CSS
+                                color_map = {
+                                    'pink': '#FC8DC2', 'blue': '#8EC6FD',
+                                    'red': '#FF6B6B', 'yellow': '#FFE066',
+                                    'green': '#66CC66', 'orange': '#FFB347',
+                                    'purple': '#CC99FF', 'cyan': '#66CCCC',
+                                    'white': '#FFFFFF',
+                                }
+                                color = color_map.get(speaker, '#FFFFFF')
+
+                                # Style by priority
+                                pri = s.get('priority', 'active')
+                                if pri == 'active':
+                                    ui.label(text).classes('text-xl font-bold text-center').style(
+                                        f'color: {color}; text-shadow: 1px 1px 2px black, -1px -1px 2px black;')
+                                elif pri == 'persist':
+                                    ui.label(text).classes('text-lg text-center').style(
+                                        f'color: {color}; opacity: 0.6; text-shadow: 1px 1px 2px black;')
+                                else:  # bg
+                                    ui.label(text).classes('text-sm text-center').style(
+                                        f'color: gray; opacity: 0.4; font-style: italic;')
+
+                                translation = s.get('zh', s.get('translation', ''))
+                                if translation:
+                                    ui.label(translation).classes('text-sm text-center text-gray-300')
+
+                        _state['prev_active'] = active
             except Exception:
                 pass
 
@@ -551,11 +735,11 @@ def index():
         go_btn.disable()
 
         # Check for existing SRT
-        existing = find_existing_srt(vid)
+        existing = find_existing_sub(vid)
         if existing:
             status_label.set_text(f'Found cached subtitles: {existing.name}')
             progress.style('display:none')
-            subs = parse_srt(existing)
+            subs = load_subs(existing)
             ui.notify(f'Loaded {len(subs)} cached subtitles')
             await start_player(vid, subs)
             go_btn.enable()
@@ -577,7 +761,7 @@ def index():
                 srt_path = await run.io_bound(generate_gemini_srt_sync, vid, update_progress)
             else:
                 srt_path = await run.io_bound(generate_srt_sync, vid, update_progress, model_select.value)
-            subs = parse_srt(srt_path)
+            subs = load_subs(srt_path)
             status_label.set_text(f'Done! {len(subs)} subtitles generated.')
             progress.set_value(1.0)
             ui.notify(f'Generated {len(subs)} subtitles', type='positive')
@@ -597,7 +781,7 @@ def index():
         if not vid:
             ui.notify('Enter a URL first', type='negative')
             return
-        existing = find_existing_srt(vid)
+        existing = find_existing_sub(vid)
         if existing:
             existing.unlink()
             ui.notify(f'Deleted {existing.name}, regenerating...')
@@ -623,12 +807,12 @@ def index():
                 capture_output=True, timeout=120))
 
         # Load existing Whisper subs
-        existing = find_existing_srt(vid)
+        existing = find_existing_sub(vid)
         if not existing:
             ui.notify('Run Go first to generate base subs', type='negative')
             return
 
-        subs = parse_srt(existing)
+        subs = load_subs(existing)
         whisper_segs = [{'start': s['start'], 'end': s['end'], 'text': s['text'].split('\n')[0]} for s in subs]
 
         align_btn.disable()
@@ -671,7 +855,7 @@ def index():
             # Cleanup video
             video_path.unlink(missing_ok=True)
 
-            new_subs = parse_srt(srt_path)
+            new_subs = load_subs(srt_path)
             status_label.set_text(f'OCR aligned! {len(new_subs)} subtitles')
             progress.set_value(1.0)
             await start_player(vid, new_subs)
